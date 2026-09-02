@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""
+循環型・生成映像システム
+数列 → 画像 → 画像解析 → 数列更新 → 次の画像
+
+外部の生成AIモデルは使いません。
+必要: Python 3, numpy, Pillow
+"""
+
+import math
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH, HEIGHT = 640, 360
+FRAMES = 240
+FPS = 24
+OUT = Path("generated_loop.gif")
+
+# システムの初期状態
+state = np.array([0.173, 0.731, 0.421, 0.913], dtype=np.float64)
+
+
+def next_state(s, feedback):
+    """現在の状態と直前画像の特徴量から次の状態を作る。"""
+    a, b, c, d = s
+
+    # 非線形な状態遷移
+    x = math.sin((a * 13.17 + feedback[0] * 7.0) * math.pi)
+    y = math.cos((b * 17.31 + feedback[1] * 5.0) * math.pi)
+    z = math.sin((c * 23.71 + feedback[2] * 11.0) * math.pi)
+    w = math.cos((d * 31.13 + feedback[3] * 3.0) * math.pi)
+
+    return np.mod(
+        np.array([
+            0.5 + 0.5 * x,
+            0.5 + 0.5 * y,
+            0.5 + 0.5 * z,
+            0.5 + 0.5 * w,
+        ]),
+        1.0,
+    )
+
+
+def make_frame(s, previous=None):
+    """状態 s から1フレームを生成する。"""
+    yy, xx = np.mgrid[0:HEIGHT, 0:WIDTH]
+    nx = xx / WIDTH
+    ny = yy / HEIGHT
+
+    # 状態から空間周波数・位相・歪みを決める
+    f1 = 3 + s[0] * 25
+    f2 = 2 + s[1] * 31
+    phase = s[2] * math.tau
+    warp = (s[3] - 0.5) * 2.0
+
+    # 波を重ねる
+    x = nx + warp * 0.12 * np.sin(ny * math.tau * (2 + s[1] * 8))
+    y = ny + warp * 0.12 * np.cos(nx * math.tau * (2 + s[2] * 8))
+
+    field = (
+        np.sin(math.tau * f1 * x + phase)
+        + np.sin(math.tau * f2 * y - phase * 1.7)
+        + np.sin(math.tau * (f1 + f2) * (x + y) + phase * 0.37)
+    )
+
+    # 非線形変換。値が閾値付近で急激に変化する
+    img = 0.5 + 0.5 * np.tanh(field * (1.2 + s[0] * 5.0))
+    img = (img * 255).astype(np.uint8)
+
+    # 前フレームとの残像
+    if previous is not None:
+        img = (
+            img.astype(np.float32) * (0.72 + 0.18 * s[2])
+            + previous.mean(axis=2).astype(np.float32) * (0.28 - 0.18 * s[2])
+        ).clip(0, 255).astype(np.uint8)
+
+    # RGB化
+    rgb = np.empty((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    rgb[..., 0] = img
+    rgb[..., 1] = np.roll(img, int(s[1] * 35), axis=1)
+    rgb[..., 2] = np.roll(img, int(s[3] * 35), axis=0)
+
+    return rgb
+
+
+def analyze(frame):
+    """生成された画像から特徴量を取り出す。
+    この値が次の状態を決定するので、生成系が閉ループになる。
+    """
+    f = frame.astype(np.float64) / 255.0
+    gray = f.mean(axis=2)
+
+    brightness = gray.mean()
+
+    # 空間的な変化量＝粗さ・複雑さの簡易指標
+    dx = np.abs(np.diff(gray, axis=1)).mean()
+    dy = np.abs(np.diff(gray, axis=0)).mean()
+    complexity = min(1.0, (dx + dy) * 4.0)
+
+    # 左右・上下の非対称性
+    asym_x = abs(gray[:, :WIDTH // 2].mean() -
+                 gray[:, WIDTH // 2:].mean())
+    asym_y = abs(gray[:HEIGHT // 2].mean() -
+                 gray[HEIGHT // 2:].mean())
+
+    return np.array([
+        brightness,
+        complexity,
+        min(1.0, asym_x * 4.0),
+        min(1.0, asym_y * 4.0),
+    ])
+
+
+def add_state_display(frame, s, feedback, index):
+    """現在の状態を小さく表示する。"""
+    im = Image.fromarray(frame)
+    draw = ImageDraw.Draw(im)
+    text = (
+        f"FRAME {index:04d}   "
+        f"S={np.round(s, 3)}   "
+        f"F={np.round(feedback, 3)}"
+    )
+    draw.rectangle((0, 0, WIDTH, 18), fill=0)
+    draw.text((5, 3), text, fill=255)
+    return np.array(im)
+
+
+def main():
+    global state
+
+    frames = []
+    previous = None
+    feedback = np.array([0.5, 0.5, 0.5, 0.5])
+
+    for i in range(FRAMES):
+        frame = make_frame(state, previous)
+        feedback = analyze(frame)
+
+        # 観察された画像が次の状態を変える
+        new_state = next_state(state, feedback)
+
+        # わずかな慣性を残す
+        state = state * 0.18 + new_state * 0.82
+
+        frames.append(add_state_display(frame, state, feedback, i))
+        previous = frame
+
+    pil_frames = [Image.fromarray(f) for f in frames]
+    pil_frames[0].save(
+        OUT,
+        save_all=True,
+        append_images=pil_frames[1:],
+        duration=int(1000 / FPS),
+        loop=0,
+        optimize=False,
+    )
+
+    print(f"生成完了: {OUT.resolve()}")
+    print("この作品では、画像の特徴量が次の画像の生成条件へ戻っています。")
+
+
+if __name__ == "__main__":
+    main()
