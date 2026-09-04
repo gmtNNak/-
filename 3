@@ -1,0 +1,410 @@
+import numpy as np
+from PIL import Image
+import subprocess
+import os
+from pathlib import Path
+
+# =========================================================
+# Autonomous Cinema 01
+#
+# state
+#   ↓
+# generate image
+#   ↓
+# observe its own image
+#   ↓
+# modify state
+#   ↓
+# generate next image
+#
+# 外部素材・生成AIなし
+# =========================================================
+
+
+WIDTH = 640
+HEIGHT = 360
+
+FPS = 24
+SECONDS = 120
+FRAMES = FPS * SECONDS
+
+FRAME_DIR = Path("autonomous_frames")
+OUTPUT = "autonomous_cinema.mp4"
+
+FRAME_DIR.mkdir(exist_ok=True)
+
+
+# ---------------------------------------------------------
+# 空間
+# ---------------------------------------------------------
+
+y, x = np.mgrid[
+    -1:1:complex(HEIGHT),
+    -1:1:complex(WIDTH)
+]
+
+radius = np.sqrt(x*x + y*y)
+angle = np.arctan2(y, x)
+
+
+# ---------------------------------------------------------
+# 映画の内部状態
+# ---------------------------------------------------------
+
+state = {
+    "phase": 0.0,
+    "frequency": 3.0,
+    "rotation": 0.0,
+    "drift_x": 0.0,
+    "drift_y": 0.0,
+
+    # 映画自身の「記憶」
+    "memory_brightness": 0.5,
+    "memory_variance": 0.0,
+
+    # 現在の行動様式
+    "mode": 0,
+
+    # 内部時間
+    "age": 0
+}
+
+
+# ---------------------------------------------------------
+# 映画が画面を作る
+# ---------------------------------------------------------
+
+def generate_frame(state):
+
+    phase = state["phase"]
+    freq = state["frequency"]
+    rot = state["rotation"]
+
+    dx = state["drift_x"]
+    dy = state["drift_y"]
+
+    # 座標そのものを回転
+    xr = (
+        np.cos(rot) * (x + dx)
+        - np.sin(rot) * (y + dy)
+    )
+
+    yr = (
+        np.sin(rot) * (x + dx)
+        + np.cos(rot) * (y + dy)
+    )
+
+
+    mode = state["mode"]
+
+
+    # -----------------------------------------------------
+    # mode 0 : 波
+    # -----------------------------------------------------
+
+    if mode == 0:
+
+        field = (
+            np.sin(
+                xr * freq * 5
+                + phase
+            )
+            +
+            np.cos(
+                yr * freq * 3
+                - phase * 0.7
+            )
+        )
+
+
+    # -----------------------------------------------------
+    # mode 1 : 円環
+    # -----------------------------------------------------
+
+    elif mode == 1:
+
+        field = np.sin(
+            radius * freq * 12
+            - phase * 2
+            + np.sin(angle * 3)
+        )
+
+
+    # -----------------------------------------------------
+    # mode 2 : 干渉
+    # -----------------------------------------------------
+
+    elif mode == 2:
+
+        a = np.sin(
+            xr * freq * 6
+            + phase
+        )
+
+        b = np.sin(
+            yr * freq * 7
+            - phase * 1.13
+        )
+
+        field = a * b
+
+
+    # -----------------------------------------------------
+    # mode 3 : 渦
+    # -----------------------------------------------------
+
+    else:
+
+        field = np.sin(
+            angle * freq
+            +
+            radius * 15
+            -
+            phase * 1.5
+        )
+
+
+    # 前の映画の記憶が現在の像に作用
+    field += (
+        state["memory_variance"]
+        * np.sin(radius * 40 + phase)
+        * 2
+    )
+
+
+    # -1〜1 → 0〜255
+    norm = (
+        field - field.min()
+    ) / (
+        field.max()
+        - field.min()
+        + 1e-9
+    )
+
+
+    # RGBをそれぞれ少し別の時間で動かす
+    r = norm
+
+    g = np.roll(
+        norm,
+        int(np.sin(phase) * 20),
+        axis=1
+    )
+
+    b = np.roll(
+        norm,
+        int(np.cos(phase * 0.7) * 20),
+        axis=0
+    )
+
+    rgb = np.stack(
+        [r, g, b],
+        axis=-1
+    )
+
+    return (rgb * 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------
+# 映画が自分自身を見る
+# ---------------------------------------------------------
+
+def observe(frame):
+
+    gray = frame.mean(axis=2) / 255.0
+
+    brightness = gray.mean()
+
+    variance = gray.var()
+
+    # 左右差
+    left = gray[:, :WIDTH//2].mean()
+    right = gray[:, WIDTH//2:].mean()
+
+    horizontal_bias = right - left
+
+    # 上下差
+    top = gray[:HEIGHT//2].mean()
+    bottom = gray[HEIGHT//2:].mean()
+
+    vertical_bias = bottom - top
+
+    return {
+        "brightness": brightness,
+        "variance": variance,
+        "horizontal_bias": horizontal_bias,
+        "vertical_bias": vertical_bias
+    }
+
+
+# ---------------------------------------------------------
+# 観測結果から映画自身が変化する
+# ---------------------------------------------------------
+
+def evolve(state, obs):
+
+    brightness = obs["brightness"]
+    variance = obs["variance"]
+
+    # 明るければ速度を落とす
+    # 暗ければ速度を上げる
+    state["phase"] += (
+        0.02
+        +
+        (0.5 - brightness) * 0.06
+    )
+
+
+    # 自分の複雑さによって周波数が変化
+    state["frequency"] += (
+        variance - state["memory_variance"]
+    ) * 0.8
+
+
+    # 暴走防止
+    state["frequency"] = np.clip(
+        state["frequency"],
+        0.5,
+        12
+    )
+
+
+    # 映像の非対称性が
+    # 映画の移動方向になる
+    state["drift_x"] += (
+        obs["horizontal_bias"] * 0.03
+    )
+
+    state["drift_y"] += (
+        obs["vertical_bias"] * 0.03
+    )
+
+
+    # 回転速度も自己観測から決定
+    state["rotation"] += (
+        0.002
+        +
+        variance * 0.015
+    )
+
+
+    # -----------------------------------------------------
+    # 記憶
+    # -----------------------------------------------------
+
+    state["memory_brightness"] = (
+        state["memory_brightness"] * 0.98
+        +
+        brightness * 0.02
+    )
+
+    state["memory_variance"] = (
+        state["memory_variance"] * 0.97
+        +
+        variance * 0.03
+    )
+
+
+    # -----------------------------------------------------
+    # 「判断」
+    #
+    # 自分自身が長時間安定すると
+    # 別の生成法へ移る
+    # -----------------------------------------------------
+
+    if abs(
+        brightness
+        - state["memory_brightness"]
+    ) < 0.0005:
+
+        if state["age"] % 180 == 0:
+
+            state["mode"] = (
+                state["mode"] + 1
+            ) % 4
+
+
+    # 極端に単調になった場合も変身
+    if variance < 0.035:
+
+        state["mode"] = (
+            state["mode"] + 1
+        ) % 4
+
+        state["frequency"] *= 1.1
+
+
+    state["age"] += 1
+
+    return state
+
+
+# ---------------------------------------------------------
+# 映画開始
+# ---------------------------------------------------------
+
+for i in range(FRAMES):
+
+    frame = generate_frame(state)
+
+    # 映画が自分を見る
+    observation = observe(frame)
+
+    # 自分を変える
+    state = evolve(
+        state,
+        observation
+    )
+
+    Image.fromarray(frame).save(
+        FRAME_DIR / f"{i:06d}.png"
+    )
+
+    if i % FPS == 0:
+        print(
+            f"{i/FPS:6.1f} sec",
+            "mode:",
+            state["mode"],
+            "freq:",
+            round(
+                state["frequency"],
+                3
+            ),
+            "variance:",
+            round(
+                observation["variance"],
+                4
+            )
+        )
+
+
+# ---------------------------------------------------------
+# mp4生成
+# ---------------------------------------------------------
+
+subprocess.run([
+    "ffmpeg",
+    "-y",
+
+    "-framerate",
+    str(FPS),
+
+    "-i",
+    str(FRAME_DIR / "%06d.png"),
+
+    "-c:v",
+    "libx264",
+
+    "-pix_fmt",
+    "yuv420p",
+
+    "-crf",
+    "18",
+
+    OUTPUT
+])
+
+
+print()
+print("finished:")
+print(OUTPUT)
