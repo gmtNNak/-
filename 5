@@ -1,0 +1,1114 @@
+import numpy as np
+import subprocess
+from collections import deque
+from dataclasses import dataclass, field
+
+# ============================================================
+# BREWING AUTONOMOUS CINEMA
+#
+#    culture
+#       ↓
+# invisible fermentation
+#       ↓
+# internal state
+#       ↓
+# image
+#       ↓
+# self-observation
+#       ↓
+# memory / boredom / tension / fatigue
+#       ↓
+# mutation
+#       └────────────→ internal state
+#
+# 外部画像・生成AI・動画素材なし
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 基本設定
+# ------------------------------------------------------------
+
+WIDTH = 640
+HEIGHT = 360
+
+FPS = 24
+
+# 完成映画の長さ
+SECONDS = 180
+
+# 映画を作る前の「醸造時間」
+# これはフレームとして保存されない
+#
+# 6000程度から開始。
+# 20000, 50000と増やしてもよい。
+BREW_STEPS = 8000
+
+OUTPUT = "brewing_autonomous_cinema.mp4"
+
+SEED = 573
+
+rng = np.random.default_rng(SEED)
+
+
+# ------------------------------------------------------------
+# 空間座標
+# ------------------------------------------------------------
+
+yy, xx = np.mgrid[
+    -1:1:complex(HEIGHT),
+    -1:1:complex(WIDTH)
+]
+
+radius = np.sqrt(xx * xx + yy * yy)
+angle = np.arctan2(yy, xx)
+
+
+# 醸造中は低解像度で自己観察する
+BW = 160
+BH = 90
+
+by, bx = np.mgrid[
+    -1:1:complex(BH),
+    -1:1:complex(BW)
+]
+
+bradius = np.sqrt(bx * bx + by * by)
+bangle = np.arctan2(by, bx)
+
+
+# ------------------------------------------------------------
+# 内部状態
+# ------------------------------------------------------------
+
+@dataclass
+class CinemaState:
+
+    # 基礎運動
+    phase: float = 0.0
+    phase2: float = 0.0
+    frequency: float = 2.7
+    rotation: float = 0.0
+
+    drift_x: float = 0.0
+    drift_y: float = 0.0
+
+    warp: float = 0.15
+    density: float = 0.5
+    grain: float = 0.02
+
+    # 色
+    color_phase: float = 0.0
+    saturation: float = 0.7
+    contrast: float = 1.0
+
+    # 心的状態に相当する内部変数
+    energy: float = 0.45
+    tension: float = 0.1
+    fatigue: float = 0.0
+    boredom: float = 0.0
+
+    # 「過去からの圧力」
+    fermentation: float = 0.0
+
+    # 映像生成様式
+    mode_a: int = 0
+    mode_b: int = 1
+
+    # mode_a → mode_b の変態途中
+    morph: float = 0.0
+
+    # ショット年齢
+    shot_age: int = 0
+
+    # システム全体の年齢
+    age: int = 0
+
+    # 変態直後の暴走防止
+    cooldown: int = 0
+
+    # 過去の知覚特徴
+    feature_memory: deque = field(
+        default_factory=lambda: deque(maxlen=180)
+    )
+
+
+state = CinemaState()
+
+
+# ------------------------------------------------------------
+# 6種類の「感覚場」
+#
+# 具体物を描かない。
+# 意味ではなく、差異・密度・粗さ・流動だけを生成する。
+# ------------------------------------------------------------
+
+def sensory_field(
+    mode,
+    X,
+    Y,
+    R,
+    A,
+    state
+):
+
+    p = state.phase
+    q = state.phase2
+    f = state.frequency
+    w = state.warp
+
+    rot = state.rotation
+
+    xr = (
+        np.cos(rot) * X
+        - np.sin(rot) * Y
+    )
+
+    yr = (
+        np.sin(rot) * X
+        + np.cos(rot) * Y
+    )
+
+    xr += state.drift_x
+    yr += state.drift_y
+
+
+    # 0: 緩慢な波面
+    if mode == 0:
+
+        field = (
+            np.sin(
+                xr * f * 4.0
+                + p
+                + np.sin(yr * 2.3 + q) * w * 4
+            )
+            +
+            0.65 * np.cos(
+                yr * f * 2.7
+                - p * 0.63
+            )
+        )
+
+
+    # 1: 円環状の干渉
+    elif mode == 1:
+
+        field = (
+            np.sin(
+                R * f * 10
+                - p * 1.3
+                + np.sin(A * 3 + q) * 1.2
+            )
+            +
+            0.4 * np.sin(
+                R * 27
+                + A * 2
+                + q
+            )
+        )
+
+
+    # 2: 交差する面
+    elif mode == 2:
+
+        a = np.sin(
+            xr * f * 5
+            + p
+            + np.sin(yr * 4 + q)
+        )
+
+        b = np.cos(
+            yr * f * 6
+            - q
+            + np.sin(xr * 3 - p)
+        )
+
+        field = a * b * 1.4
+
+
+    # 3: 渦
+    elif mode == 3:
+
+        field = (
+            np.sin(
+                A * (2.0 + f * 0.7)
+                +
+                R * (10 + f * 2)
+                -
+                p
+            )
+            +
+            0.45 * np.sin(
+                R * 35
+                - q * 0.6
+            )
+        )
+
+
+    # 4: 折り畳まれる空間
+    elif mode == 4:
+
+        folded_x = np.abs(
+            np.mod(
+                xr * f + p * 0.15,
+                2.0
+            ) - 1.0
+        )
+
+        folded_y = np.abs(
+            np.mod(
+                yr * f - q * 0.12,
+                2.0
+            ) - 1.0
+        )
+
+        field = np.sin(
+            folded_x * 9
+            +
+            folded_y * 11
+            +
+            p
+        )
+
+
+    # 5: 準セル状の生成
+    else:
+
+        f1 = np.sin(
+            xr * f * 7
+            + np.sin(yr * 3 + p)
+        )
+
+        f2 = np.cos(
+            yr * f * 5
+            + np.cos(xr * 4 - q)
+        )
+
+        f3 = np.sin(
+            (xr + yr)
+            * f
+            * 4
+            + p * 0.31
+        )
+
+        field = np.tanh(
+            (f1 + f2 + f3)
+            * (0.8 + state.density)
+        )
+
+
+    # 発酵の蓄積が微細構造として侵入する
+    field += (
+        state.fermentation
+        * 0.35
+        * np.sin(
+            R * (
+                18
+                + state.fermentation * 22
+            )
+            + q
+        )
+    )
+
+    return field
+
+
+# ------------------------------------------------------------
+# mode同士を滑らかに変態させる
+# ------------------------------------------------------------
+
+def generate_scalar(
+    X,
+    Y,
+    R,
+    A,
+    state
+):
+
+    a = sensory_field(
+        state.mode_a,
+        X, Y, R, A,
+        state
+    )
+
+    b = sensory_field(
+        state.mode_b,
+        X, Y, R, A,
+        state
+    )
+
+    # smoothstep
+    t = np.clip(
+        state.morph,
+        0.0,
+        1.0
+    )
+
+    t = t * t * (3 - 2 * t)
+
+    field = (
+        a * (1 - t)
+        +
+        b * t
+    )
+
+    return field
+
+
+# ------------------------------------------------------------
+# スカラー場 → RGB
+# ------------------------------------------------------------
+
+def field_to_rgb(
+    field,
+    state
+):
+
+    # 完全なmin-max正規化をすると毎フレーム
+    # コントラストが固定されるため、
+    # tanhで自然な増減を残す。
+    v = np.tanh(
+        field
+        * state.contrast
+    )
+
+    cp = state.color_phase
+
+    r = 0.5 + 0.5 * np.sin(
+        v * 2.8 + cp
+    )
+
+    g = 0.5 + 0.5 * np.sin(
+        v * 3.4 + cp + 2.1
+    )
+
+    b = 0.5 + 0.5 * np.sin(
+        v * 2.3 + cp + 4.2
+    )
+
+    rgb = np.stack(
+        [r, g, b],
+        axis=-1
+    )
+
+    # 彩度
+    gray = rgb.mean(
+        axis=2,
+        keepdims=True
+    )
+
+    rgb = (
+        gray
+        +
+        (rgb - gray)
+        * state.saturation
+    )
+
+    rgb = np.clip(
+        rgb,
+        0,
+        1
+    )
+
+    return (
+        rgb * 255
+    ).astype(np.uint8)
+
+
+# ------------------------------------------------------------
+# 映画自身による知覚
+# ------------------------------------------------------------
+
+def observe(
+    field,
+    previous_field=None
+):
+
+    mean = float(
+        field.mean()
+    )
+
+    variance = float(
+        field.var()
+    )
+
+    # 空間的な変化量
+    dx = np.diff(
+        field,
+        axis=1
+    )
+
+    dy = np.diff(
+        field,
+        axis=0
+    )
+
+    edge = float(
+        (
+            np.mean(np.abs(dx))
+            +
+            np.mean(np.abs(dy))
+        ) * 0.5
+    )
+
+    # 左右差
+    midx = field.shape[1] // 2
+
+    left = field[:, :midx].mean()
+    right = field[:, midx:].mean()
+
+    asym_x = float(
+        right - left
+    )
+
+    # 上下差
+    midy = field.shape[0] // 2
+
+    top = field[:midy].mean()
+    bottom = field[midy:].mean()
+
+    asym_y = float(
+        bottom - top
+    )
+
+    # 時間方向の変化
+    if previous_field is None:
+
+        temporal = 0.0
+
+    else:
+
+        temporal = float(
+            np.mean(
+                np.abs(
+                    field
+                    - previous_field
+                )
+            )
+        )
+
+    return np.array([
+        mean,
+        variance,
+        edge,
+        temporal,
+        asym_x,
+        asym_y
+    ], dtype=np.float64)
+
+
+# ------------------------------------------------------------
+# 「新奇性」
+#
+# 現在の知覚が過去の知覚とどれくらい違うか
+# ------------------------------------------------------------
+
+def calculate_novelty(
+    features,
+    state
+):
+
+    if len(
+        state.feature_memory
+    ) < 15:
+
+        return 1.0
+
+    memory = np.array(
+        state.feature_memory
+    )
+
+    # 過去平均との差
+    centre = memory.mean(
+        axis=0
+    )
+
+    scale = memory.std(
+        axis=0
+    ) + 0.0001
+
+    z = (
+        features
+        - centre
+    ) / scale
+
+    novelty = float(
+        np.sqrt(
+            np.mean(
+                z * z
+            )
+        )
+    )
+
+    return min(
+        novelty / 3.0,
+        2.0
+    )
+
+
+# ------------------------------------------------------------
+# 変態
+# ------------------------------------------------------------
+
+def mutate(state):
+
+    old = state.mode_b
+
+    candidates = [
+        i
+        for i in range(6)
+        if i != old
+    ]
+
+    new_mode = int(
+        rng.choice(
+            candidates
+        )
+    )
+
+    state.mode_a = old
+    state.mode_b = new_mode
+
+    state.morph = 0.0
+    state.shot_age = 0
+
+    # 変態の度合いは毎回異なる
+    state.frequency *= rng.uniform(
+        0.72,
+        1.38
+    )
+
+    state.frequency = float(
+        np.clip(
+            state.frequency,
+            0.6,
+            8.5
+        )
+    )
+
+    state.warp = float(
+        np.clip(
+            state.warp
+            + rng.normal(0, 0.15),
+            0.02,
+            1.4
+        )
+    )
+
+    state.density = float(
+        np.clip(
+            state.density
+            + rng.normal(0, 0.18),
+            0.05,
+            1.8
+        )
+    )
+
+    state.color_phase += rng.uniform(
+        -1.0,
+        1.0
+    )
+
+    state.saturation = float(
+        np.clip(
+            state.saturation
+            + rng.normal(0, 0.12),
+            0.15,
+            1.25
+        )
+    )
+
+    state.contrast = float(
+        np.clip(
+            state.contrast
+            + rng.normal(0, 0.14),
+            0.55,
+            1.8
+        )
+    )
+
+    # 変態によって退屈は減る
+    state.boredom *= 0.18
+
+    # しかし緊張は完全には消えない
+    state.tension *= 0.55
+
+    # 発酵物は少し残る
+    state.fermentation *= 0.68
+
+    state.cooldown = FPS * 3
+
+
+# ------------------------------------------------------------
+# 内部状態更新
+# ------------------------------------------------------------
+
+def evolve(
+    state,
+    features,
+    novelty
+):
+
+    temporal = features[3]
+    variance = features[1]
+    edge = features[2]
+
+    # --------------------------------------------------------
+    # 倦怠
+    #
+    # 新奇性が低い状態が続くほど蓄積する
+    # --------------------------------------------------------
+
+    if novelty < 0.45:
+
+        state.boredom += (
+            0.0015
+            +
+            (0.45 - novelty)
+            * 0.006
+        )
+
+    else:
+
+        state.boredom *= 0.992
+
+
+    # --------------------------------------------------------
+    # 疲労
+    #
+    # 変化が強すぎると増える
+    # --------------------------------------------------------
+
+    if temporal > 0.12:
+
+        state.fatigue += (
+            temporal
+            * 0.0025
+        )
+
+    else:
+
+        state.fatigue *= 0.997
+
+
+    # --------------------------------------------------------
+    # 緊張
+    # --------------------------------------------------------
+
+    state.tension += (
+        state.boredom * 0.0015
+        +
+        edge * 0.00015
+        -
+        state.fatigue * 0.0008
+    )
+
+    state.tension = float(
+        np.clip(
+            state.tension,
+            0,
+            2
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # 発酵
+    #
+    # 消えずに非常にゆっくり蓄積する。
+    # --------------------------------------------------------
+
+    state.fermentation += (
+        (
+            state.boredom
+            + state.tension * 0.35
+        )
+        * 0.0005
+    )
+
+    state.fermentation *= 0.99995
+
+    state.fermentation = float(
+        np.clip(
+            state.fermentation,
+            0,
+            2.5
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # エネルギー
+    # --------------------------------------------------------
+
+    target_energy = (
+        0.32
+        +
+        state.tension * 0.32
+        -
+        state.fatigue * 0.2
+    )
+
+    state.energy += (
+        target_energy
+        - state.energy
+    ) * 0.002
+
+    state.energy = float(
+        np.clip(
+            state.energy,
+            0.05,
+            1.5
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # 実際の運動
+    # --------------------------------------------------------
+
+    speed = (
+        0.006
+        +
+        state.energy * 0.022
+    )
+
+    state.phase += speed
+
+    state.phase2 += (
+        speed
+        * (
+            0.51
+            + state.fermentation * 0.07
+        )
+    )
+
+    state.rotation += (
+        0.00035
+        +
+        state.tension * 0.0007
+    )
+
+    state.drift_x += (
+        features[4]
+        * 0.0005
+    )
+
+    state.drift_y += (
+        features[5]
+        * 0.0005
+    )
+
+
+    # 漂流を無限に増やさない
+    state.drift_x *= 0.9998
+    state.drift_y *= 0.9998
+
+
+    # --------------------------------------------------------
+    # 色にも独立した長周期を持たせる
+    # --------------------------------------------------------
+
+    state.color_phase += (
+        0.0007
+        +
+        state.energy * 0.0006
+    )
+
+
+    # --------------------------------------------------------
+    # モーフィング速度
+    #
+    # 一瞬で切り替えない
+    # 数秒～十数秒かけて変態する
+    # --------------------------------------------------------
+
+    if state.morph < 1:
+
+        state.morph += (
+            0.0009
+            +
+            state.tension * 0.00045
+        )
+
+        state.morph = min(
+            state.morph,
+            1.0
+        )
+
+
+    # --------------------------------------------------------
+    # 変態判定
+    #
+    # 1. 長時間の倦怠
+    # 2. 内部緊張
+    # 3. 最大ショット長
+    #
+    # 時計だけでは決めない。
+    # --------------------------------------------------------
+
+    minimum_shot = FPS * 7
+    maximum_shot = FPS * 42
+
+    may_mutate = (
+        state.cooldown <= 0
+        and state.shot_age > minimum_shot
+        and state.morph >= 0.98
+    )
+
+    pressure = (
+        state.boredom
+        + state.tension * 0.48
+        + state.fermentation * 0.21
+    )
+
+    if may_mutate:
+
+        if (
+            pressure > 0.72
+            or state.shot_age > maximum_shot
+        ):
+
+            mutate(state)
+
+
+    if state.cooldown > 0:
+
+        state.cooldown -= 1
+
+
+    # --------------------------------------------------------
+    # 記憶
+    # --------------------------------------------------------
+
+    state.feature_memory.append(
+        features.copy()
+    )
+
+    state.shot_age += 1
+    state.age += 1
+
+
+# ============================================================
+# 第一段階
+#
+# INVISIBLE BREWING
+#
+# 観客には見せない。
+# 映画が生まれる以前の時間。
+# ============================================================
+
+print()
+print("================================")
+print(" invisible brewing")
+print("================================")
+print()
+
+previous = None
+
+for i in range(
+    BREW_STEPS
+):
+
+    field = generate_scalar(
+        bx,
+        by,
+        bradius,
+        bangle,
+        state
+    )
+
+    features = observe(
+        field,
+        previous
+    )
+
+    novelty = calculate_novelty(
+        features,
+        state
+    )
+
+    evolve(
+        state,
+        features,
+        novelty
+    )
+
+    previous = field.copy()
+
+    if i % 500 == 0:
+
+        print(
+            f"brew {i:6d}/{BREW_STEPS}",
+            "mode",
+            state.mode_b,
+            "boredom",
+            round(
+                state.boredom,
+                3
+            ),
+            "tension",
+            round(
+                state.tension,
+                3
+            ),
+            "fermentation",
+            round(
+                state.fermentation,
+                3
+            )
+        )
+
+
+# ============================================================
+# 第二段階
+#
+# THE FILM APPEARS
+# ============================================================
+
+print()
+print("================================")
+print(" cinema begins")
+print("================================")
+print()
+
+
+ffmpeg = subprocess.Popen(
+    [
+        "ffmpeg",
+        "-y",
+
+        "-f",
+        "rawvideo",
+
+        "-vcodec",
+        "rawvideo",
+
+        "-pix_fmt",
+        "rgb24",
+
+        "-s",
+        f"{WIDTH}x{HEIGHT}",
+
+        "-r",
+        str(FPS),
+
+        "-i",
+        "-",
+
+        "-an",
+
+        "-c:v",
+        "libx264",
+
+        "-preset",
+        "slow",
+
+        "-crf",
+        "18",
+
+        # YouTube / Gravity等との互換性
+        "-pix_fmt",
+        "yuv420p",
+
+        "-movflags",
+        "+faststart",
+
+        OUTPUT
+    ],
+
+    stdin=subprocess.PIPE
+)
+
+
+previous = None
+
+total_frames = (
+    SECONDS * FPS
+)
+
+
+for frame_number in range(
+    total_frames
+):
+
+    field = generate_scalar(
+        xx,
+        yy,
+        radius,
+        angle,
+        state
+    )
+
+    features = observe(
+        field,
+        previous
+    )
+
+    novelty = calculate_novelty(
+        features,
+        state
+    )
+
+    evolve(
+        state,
+        features,
+        novelty
+    )
+
+    rgb = field_to_rgb(
+        field,
+        state
+    )
+
+    ffmpeg.stdin.write(
+        rgb.tobytes()
+    )
+
+    previous = field.copy()
+
+
+    if frame_number % FPS == 0:
+
+        seconds = (
+            frame_number / FPS
+        )
+
+        print(
+            f"{seconds:7.1f} sec",
+            "mode",
+            state.mode_b,
+            "novelty",
+            round(
+                novelty,
+                3
+            ),
+            "boredom",
+            round(
+                state.boredom,
+                3
+            ),
+            "tension",
+            round(
+                state.tension,
+                3
+            ),
+            "ferment",
+            round(
+                state.fermentation,
+                3
+            )
+        )
+
+
+ffmpeg.stdin.close()
+
+ffmpeg.wait()
+
+
+print()
+print("==============================")
+print(" finished")
+print("==============================")
+print()
+print(OUTPUT)
